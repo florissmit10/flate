@@ -40,7 +40,9 @@ func (f *Fetcher) helmRepoAuthOptions(r *manifest.HelmRepository) ([]getter.Opti
 	if err != nil {
 		return nil, err
 	}
-	opts := []getter.Option{getter.WithBasicAuth(username, password)}
+	// helm only sends basic auth to the scheme+host of WithURL; without it
+	// the credentials are silently dropped.
+	opts := []getter.Option{getter.WithURL(r.URL), getter.WithBasicAuth(username, password)}
 	if r.PassCredentials {
 		opts = append(opts, getter.WithPassCredentialsAll(true))
 	}

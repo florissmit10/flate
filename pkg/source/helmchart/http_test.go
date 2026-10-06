@@ -255,3 +255,35 @@ func buildChartTarGz(t *testing.T, name, version string) []byte {
 	_ = gw.Close()
 	return buf.Bytes()
 }
+
+func TestFetchHTTPChart_BasicAuth(t *testing.T) {
+	chartBytes := buildChartTarGz(t, "app-template", "1.0.0")
+	requireAuth := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if u, p, ok := r.BasicAuth(); !ok || u != "alice" || p != "hunter2" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			next(w, r)
+		}
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/index.yaml", requireAuth(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(helmRepoIndex(chartDigest(chartBytes))))
+	}))
+	mux.HandleFunc("/app-template-1.0.0.tgz", requireAuth(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(chartBytes)
+	}))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	r := httpRepo(srv.URL)
+	r.SecretRef = &manifest.LocalObjectReference{Name: "creds"}
+	f := newHTTPFetcherWithSecrets(t, r, func(_, _ string) *manifest.Secret {
+		return &manifest.Secret{StringData: map[string]any{"username": "alice", "password": "hunter2"}}
+	})
+
+	if _, err := f.Fetch(context.Background(), helmChart("repo", "app-template", "1.0.0")); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+}
