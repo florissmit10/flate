@@ -265,11 +265,13 @@ func TestFetcher_ResolveConfig_RegistryFallback(t *testing.T) {
 		name     string
 		secret   *manifest.Secret
 		config   string // registry config content; "" leaves --registry-config unset
+		docker   string // docker default config content
 		fallback bool
 		wantPath bool
 		wantErr  error // nil with wantPath false means any non-sentinel error
 	}{
 		{name: "not found, fallback", config: covering, fallback: true, wantPath: true},
+		{name: "not found, docker default fallback", docker: covering, fallback: true, wantPath: true},
 		{
 			name:   "placeholder-wiped, fallback",
 			secret: &manifest.Secret{StringData: map[string]any{".dockerconfigjson": "..PLACEHOLDER_.dockerconfigjson.."}},
@@ -282,7 +284,13 @@ func TestFetcher_ResolveConfig_RegistryFallback(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("DOCKER_CONFIG", t.TempDir()) // keep the host's docker config out
+			dockerDir := t.TempDir() // keeps the host's docker config out
+			if tt.docker != "" {
+				if err := os.WriteFile(filepath.Join(dockerDir, "config.json"), []byte(tt.docker), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("DOCKER_CONFIG", dockerDir)
 			f := &Fetcher{Secrets: func(_, _ string) *manifest.Secret { return tt.secret }}
 			if tt.config != "" {
 				f.RegistryConfig = writeConfig(t, tt.config)
