@@ -163,6 +163,13 @@ func (c *Controller) reconcile(ctx context.Context, obj manifest.BaseManifest) e
 	c.Tasks.YieldSlot(func() {
 		artifact, fetchErr = fetcher.Fetch(ctx, obj)
 	})
+	if errors.Is(fetchErr, manifest.ErrMissingSecret) {
+		// Before skipping or failing, let the fetcher try the global
+		// registry credentials in place of the unresolvable Secret.
+		c.Tasks.YieldSlot(func() {
+			artifact, fetchErr = fetcher.Fetch(src.WithRegistryFallback(ctx), obj)
+		})
+	}
 	if fetchErr != nil {
 		c.Logger().Debug("fetch failed", "id", id.String(), "duration", time.Since(started), "err", fetchErr)
 		// Skip a missing auth Secret either when the user asked globally

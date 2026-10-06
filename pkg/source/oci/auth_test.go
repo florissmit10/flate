@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -11,6 +12,7 @@ import (
 
 	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/manifest"
+	"github.com/home-operations/flate/pkg/source"
 )
 
 func ociRepo(name string, set func(s *sourcev1.OCIRepositorySpec)) *manifest.OCIRepository {
@@ -126,7 +128,7 @@ func TestFetcher_NonGenericProvider(t *testing.T) {
 func TestFetcher_ResolveConfig_NoSecretFallsBackToGlobal(t *testing.T) {
 	f := &Fetcher{RegistryConfig: "/etc/docker/config.json"}
 	repo := ociRepo("o", nil)
-	path, cleanup, err := f.resolveRegistryConfig(repo)
+	path, cleanup, err := f.resolveRegistryConfig(context.Background(), repo)
 	defer cleanup()
 	if err != nil {
 		t.Fatalf("resolveRegistryConfig: %v", err)
@@ -149,7 +151,7 @@ func TestFetcher_ResolveConfig_SecretWritesTempFile(t *testing.T) {
 		s.URL = "oci://ghcr.io/x/y"
 		s.SecretRef = &manifest.LocalObjectReference{Name: "ghcr-creds"}
 	})
-	path, cleanup, err := f.resolveRegistryConfig(repo)
+	path, cleanup, err := f.resolveRegistryConfig(context.Background(), repo)
 	defer cleanup()
 	if err != nil {
 		t.Fatalf("resolveRegistryConfig: %v", err)
@@ -182,7 +184,7 @@ func TestFetcher_ResolveConfig_SecretMissingDockerConfigJSON(t *testing.T) {
 	repo := ociRepo("o", func(s *sourcev1.OCIRepositorySpec) {
 		s.SecretRef = &manifest.LocalObjectReference{Name: "wrong-shape"}
 	})
-	_, cleanup, err := f.resolveRegistryConfig(repo)
+	_, cleanup, err := f.resolveRegistryConfig(context.Background(), repo)
 	cleanup()
 	if err == nil || !strings.Contains(err.Error(), ".dockerconfigjson") {
 		t.Errorf("expected missing-.dockerconfigjson error; got %v", err)
@@ -202,7 +204,7 @@ func TestFetcher_ResolveConfig_SecretRefWithoutGetter(t *testing.T) {
 	repo := ociRepo("o", func(s *sourcev1.OCIRepositorySpec) {
 		s.SecretRef = &manifest.LocalObjectReference{Name: "creds"}
 	})
-	_, cleanup, err := f.resolveRegistryConfig(repo)
+	_, cleanup, err := f.resolveRegistryConfig(context.Background(), repo)
 	cleanup()
 	if err == nil || !strings.Contains(err.Error(), "source.SecretGetter") {
 		t.Errorf("expected source.SecretGetter error; got %v", err)
@@ -216,7 +218,7 @@ func TestFetcher_ResolveConfig_SecretNotFound(t *testing.T) {
 	repo := ociRepo("o", func(s *sourcev1.OCIRepositorySpec) {
 		s.SecretRef = &manifest.LocalObjectReference{Name: "missing"}
 	})
-	_, cleanup, err := f.resolveRegistryConfig(repo)
+	_, cleanup, err := f.resolveRegistryConfig(context.Background(), repo)
 	cleanup()
 	if err == nil || !strings.Contains(err.Error(), "secret ns/missing not found") {
 		t.Errorf("expected secret-not-found error; got %v", err)
@@ -246,5 +248,70 @@ func TestFetcher_ForceGenericProvider(t *testing.T) {
 	}
 	if !errors.Is(err, manifest.ErrMissingSecret) {
 		t.Errorf("want ErrMissingSecret from the generic path; got %v", err)
+	}
+}
+
+func TestFetcher_ResolveConfig_RegistryFallback(t *testing.T) {
+	writeConfig := func(t *testing.T, content string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	covering := `{"auths":{"ghcr.io":{"auth":"YWxpY2U6aHVudGVyMg=="}}}`
+	tests := []struct {
+		name     string
+		secret   *manifest.Secret
+		config   string // registry config content; "" leaves --registry-config unset
+		fallback bool
+		wantPath bool
+		wantErr  error // nil with wantPath false means any non-sentinel error
+	}{
+		{name: "not found, fallback", config: covering, fallback: true, wantPath: true},
+		{
+			name:   "placeholder-wiped, fallback",
+			secret: &manifest.Secret{StringData: map[string]any{".dockerconfigjson": "..PLACEHOLDER_.dockerconfigjson.."}},
+			config: covering, fallback: true, wantPath: true,
+		},
+		{name: "first fetch keeps the sentinel", config: covering, wantErr: manifest.ErrMissingSecret},
+		{name: "config covers another registry", config: `{"auths":{"quay.io":{"auth":"YWxpY2U6aHVudGVyMg=="}}}`, fallback: true, wantErr: manifest.ErrMissingSecret},
+		{name: "no config at all", fallback: true, wantErr: manifest.ErrMissingSecret},
+		{name: "corrupt config fails loud", config: `{"auths":`, fallback: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DOCKER_CONFIG", t.TempDir()) // keep the host's docker config out
+			f := &Fetcher{Secrets: func(_, _ string) *manifest.Secret { return tt.secret }}
+			if tt.config != "" {
+				f.RegistryConfig = writeConfig(t, tt.config)
+			}
+			repo := ociRepo("o", func(s *sourcev1.OCIRepositorySpec) {
+				s.URL = "oci://ghcr.io/x/y"
+				s.SecretRef = &manifest.LocalObjectReference{Name: "creds"}
+			})
+			ctx := context.Background()
+			if tt.fallback {
+				ctx = source.WithRegistryFallback(ctx)
+			}
+
+			path, cleanup, err := f.resolveRegistryConfig(ctx, repo)
+			cleanup()
+			switch {
+			case tt.wantPath:
+				if err != nil || path != f.RegistryConfig {
+					t.Fatalf("got (%q, %v), want (%q, nil)", path, err, f.RegistryConfig)
+				}
+			case tt.wantErr != nil:
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("err = %v, want %v", err, tt.wantErr)
+				}
+			default:
+				if err == nil || errors.Is(err, manifest.ErrMissingSecret) {
+					t.Fatalf("err = %v, want a loud non-sentinel error", err)
+				}
+			}
+		})
 	}
 }

@@ -1,6 +1,7 @@
 package oci
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"os"
 
+	"oras.land/oras-go/v2/registry"
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
 	"oras.land/oras-go/v2/registry/remote/credentials"
@@ -86,9 +88,12 @@ func (f *Fetcher) resolveTLS(repo *manifest.OCIRepository) (*tls.Config, error) 
 //  3. docker's default lookup (~/.docker/config.json), handled inside
 //     loadCredentials when configPath is empty.
 //
+// 2 and 3 replace an unresolvable secretRef only on a fallback retry (see
+// registryFallback).
+//
 // The cleanup func removes any temp file the SecretRef path created;
 // safe to call when no temp file was made (no-op).
-func (f *Fetcher) resolveRegistryConfig(repo *manifest.OCIRepository) (string, func(), error) {
+func (f *Fetcher) resolveRegistryConfig(ctx context.Context, repo *manifest.OCIRepository) (string, func(), error) {
 	noCleanup := func() {}
 	if repo.SecretRef == nil {
 		return f.RegistryConfig, noCleanup, nil
@@ -98,7 +103,7 @@ func (f *Fetcher) resolveRegistryConfig(repo *manifest.OCIRepository) (string, f
 	}
 	sec := f.Secrets(repo.Namespace, repo.SecretRef.Name)
 	if sec == nil {
-		return "", noCleanup, source.MissingSecretErr("OCIRepository", repo.Namespace, repo.Name, repo.SecretRef.Name, "not found")
+		return f.registryFallback(ctx, repo, source.MissingSecretErr("OCIRepository", repo.Namespace, repo.Name, repo.SecretRef.Name, "not found"))
 	}
 	configJSON := source.StringFromSecret(sec, dockerConfigJSONKey)
 	if configJSON == "" {
@@ -110,7 +115,7 @@ func (f *Fetcher) resolveRegistryConfig(repo *manifest.OCIRepository) (string, f
 		// Same ErrMissingSecret sentinel so --allow-missing-secrets
 		// covers both — matching only the literal "secret not found"
 		// path would leave the actual reporter's case still failing.
-		return "", noCleanup, source.MissingSecretErr("OCIRepository", repo.Namespace, repo.Name, repo.SecretRef.Name, "missing .dockerconfigjson (must be type kubernetes.io/dockerconfigjson)")
+		return f.registryFallback(ctx, repo, source.MissingSecretErr("OCIRepository", repo.Namespace, repo.Name, repo.SecretRef.Name, "missing .dockerconfigjson (must be type kubernetes.io/dockerconfigjson)"))
 	}
 	// System temp (dir ""): the docker credential store only needs the
 	// file to exist for the duration of the pull.
@@ -120,6 +125,41 @@ func (f *Fetcher) resolveRegistryConfig(repo *manifest.OCIRepository) (string, f
 		return "", noCleanup, err
 	}
 	return path, tf.Cleanup, nil
+}
+
+// registryFallback stands in for an unresolvable secretRef on a fallback
+// retry: it returns the global registry config when that config holds a
+// credential for repo's registry, and missing otherwise. Requiring a
+// credential keeps a config that only covers other registries from turning
+// a skippable missing Secret into a 401.
+func (f *Fetcher) registryFallback(ctx context.Context, repo *manifest.OCIRepository, missing error) (string, func(), error) {
+	noCleanup := func() {}
+	if !source.RegistryFallback(ctx) {
+		return "", noCleanup, missing
+	}
+	parsed, err := parseOCIRef(repo.URL)
+	if err != nil {
+		return "", noCleanup, err
+	}
+	ref, err := registry.ParseReference(parsed)
+	if err != nil {
+		return "", noCleanup, fmt.Errorf("oras: %w", err)
+	}
+	credStore, err := loadCredentials(f.RegistryConfig)
+	if err != nil {
+		return "", noCleanup, err
+	}
+	if credStore == nil {
+		return "", noCleanup, missing
+	}
+	// A lookup error (e.g. a credential helper not installed on this
+	// machine) counts as no credential, keeping the source skippable.
+	if cred, err := credStore.Get(ctx, ref.Registry); err != nil || cred == auth.EmptyCredential {
+		return "", noCleanup, missing
+	}
+	slog.Info("oci: secretRef unresolvable, using registry config",
+		"id", ociID(repo), "registry", ref.Registry)
+	return f.RegistryConfig, noCleanup, nil
 }
 
 // loadCredentials returns a credentials.Store backed by the given config

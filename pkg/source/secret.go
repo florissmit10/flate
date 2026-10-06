@@ -1,6 +1,7 @@
 package source
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 
@@ -44,6 +45,20 @@ func MissingSecretErr(kind, ns, name, secretRef, reason string) error {
 		Secret: manifest.NamedResource{Kind: manifest.KindSecret, Namespace: ns, Name: secretRef},
 		Detail: reason,
 	}
+}
+
+type registryFallbackKey struct{}
+
+// WithRegistryFallback marks ctx for a fetch retried after ErrMissingSecret:
+// an OCI fetch may then authenticate with the global registry config.
+func WithRegistryFallback(ctx context.Context) context.Context {
+	return context.WithValue(ctx, registryFallbackKey{}, true)
+}
+
+// RegistryFallback reports whether ctx was marked by WithRegistryFallback.
+func RegistryFallback(ctx context.Context) bool {
+	v, _ := ctx.Value(registryFallbackKey{}).(bool)
+	return v
 }
 
 // resolveSecretRef fetches the Secret a set *SecretRef points at, shared

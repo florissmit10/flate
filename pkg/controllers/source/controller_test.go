@@ -316,6 +316,36 @@ func TestController_MissingSecretNoProducerFailsWithoutFlag(t *testing.T) {
 	}
 }
 
+// fallbackFetcher fails with a missing Secret unless ctx carries the
+// registry-fallback marker.
+type fallbackFetcher struct{ plainCalls int }
+
+func (f *fallbackFetcher) Fetch(ctx context.Context, _ manifest.BaseManifest) (*store.SourceArtifact, error) {
+	if src.RegistryFallback(ctx) {
+		return &store.SourceArtifact{Kind: manifest.KindOCIRepository}, nil
+	}
+	f.plainCalls++
+	return nil, src.MissingSecretErr(manifest.KindOCIRepository, "ns", "r", "ghcr-creds", "not found")
+}
+
+func TestController_MissingSecretRetriesWithRegistryFallback(t *testing.T) {
+	f := &fallbackFetcher{}
+	c, st := newController(t, map[string]src.Fetcher{manifest.KindOCIRepository: f})
+	repo := &manifest.OCIRepository{Name: "r", Namespace: "ns", URL: "oci://example/img"}
+	st.AddObject(repo)
+
+	info := dispatchToFixpoint(t, c, st, repo.Named())
+	if info.Status != store.StatusReady || store.IsSkipped(info) {
+		t.Fatalf("status = %+v, want Ready without a skip", info)
+	}
+	if st.GetArtifact(repo.Named()) == nil {
+		t.Error("fallback fetch must store its artifact")
+	}
+	if f.plainCalls != 1 {
+		t.Errorf("plain fetches = %d, want 1 before the fallback retry", f.plainCalls)
+	}
+}
+
 func TestController_ChangeFilterSkipsUnaffected(t *testing.T) {
 	f := &fakeFetcher{artifact: &store.SourceArtifact{Kind: manifest.KindGitRepository}}
 
