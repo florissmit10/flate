@@ -5,6 +5,7 @@ import (
 	"maps"
 	"slices"
 
+	"github.com/home-operations/flate/pkg/change"
 	"github.com/home-operations/flate/pkg/controllers/base"
 	"github.com/home-operations/flate/pkg/controllers/helmrelease"
 	"github.com/home-operations/flate/pkg/controllers/kustomization"
@@ -27,13 +28,32 @@ type orchestratorExistence struct {
 	idx         *loader.ExistenceIndex
 	store       *store.Store
 	wipeSecrets bool
+	filter      *change.Filter
 }
 
 func (e *orchestratorExistence) Promote(id manifest.NamedResource) bool {
-	return e.idx.Promote(e.store, id, e.wipeSecrets)
+	return e.idx.Promote(e.store, id, e.wipeSecrets, e.admit)
+}
+
+func (e *orchestratorExistence) admit(obj manifest.BaseManifest) bool {
+	switch obj.(type) {
+	case *manifest.ConfigMap, *manifest.Secret, *manifest.ResourceSetInputProvider,
+		*manifest.GitRepository, *manifest.HelmRepository, *manifest.OCIRepository,
+		*manifest.HelmChartSource, *manifest.Bucket, *manifest.ExternalArtifact:
+		return e.filter.ShouldReconcile(obj.Named())
+	}
+	return false
 }
 
 func (e *orchestratorExistence) IsFileIndexed(id manifest.NamedResource) bool {
+	if _, ok := e.idx.Get(id); ok {
+		return true
+	}
+	if id.Namespace == "" {
+		return false
+	}
+	// Discovery retains bare identities until a parent stamps the namespace.
+	id.Namespace = ""
 	_, ok := e.idx.Get(id)
 	return ok
 }
@@ -110,6 +130,7 @@ func (o *Orchestrator) configureControllers() {
 		idx:         o.existence,
 		store:       o.store,
 		wipeSecrets: o.cfg.WipeSecrets,
+		filter:      o.filter,
 	}
 	// selfProduces reports whether consumer's OWN render emits cm — the
 	// graph-aware self-substitute signal collectDeps uses to drop a
