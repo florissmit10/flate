@@ -26,7 +26,18 @@ func (d dagDispatcher) Dispatch(ctx context.Context, id schedule.NodeID, drainLe
 	case id.Kind == manifest.KindHelmRelease:
 		blocked = o.hrc.ReconcileNode(ctx, id, drainLevel)
 	case id.Kind == manifest.KindResourceSet:
+		before, _ := o.store.GetArtifact(id).(*store.ResourceSetArtifact)
 		blocked = o.rsc.ReconcileNode(ctx, id, drainLevel)
+		if len(blocked) == 0 && before != nil && before.Fingerprint != "" && o.store.GetArtifact(id) == before {
+			info, ok := o.store.GetStatus(id)
+			// A fresh fingerprint replaces the artifact even for identical docs.
+			// Nil dependencies alone do not prove success: gates and skips
+			// may preserve an artifact and an informative Ready status.
+			// deleteLocked removes conditions with the object; Ready implies prior presence on this path.
+			if ok && info.Status == store.StatusReady && info.Message == "" {
+				return schedule.OutcomeTerminalNoop, nil
+			}
+		}
 	case o.src.Owns(id):
 		blocked = o.src.ReconcileNode(ctx, id, drainLevel)
 	default:
@@ -35,6 +46,11 @@ func (d dagDispatcher) Dispatch(ctx context.Context, id schedule.NodeID, drainLe
 	}
 	if len(blocked) > 0 {
 		return schedule.OutcomeBlocked, blocked
+	}
+	if info, ok := o.store.GetStatus(id); ok && info.Status == store.StatusFailed {
+		if failed := o.store.BlockedBy(id); len(failed) > 0 {
+			return schedule.OutcomeDependencyFailed, failed
+		}
 	}
 	return schedule.OutcomeTerminal, nil
 }
@@ -106,15 +122,14 @@ func (o *Orchestrator) runDAG(ctx context.Context) error {
 	//   an arriving dep (source/CM/KS), and re-dispatch a terminal producer
 	//   whose Refire status-reset re-arrival signals a changed-only
 	//   resurrection. The listener runs OUTSIDE the store shard lock (AddObject
-	//   fires it post-unlock), and dagStatusReady's read completes before
-	//   sched.OnArrival takes sched.mu — so there is no store-lock ↔ sched.mu
-	//   inversion.
+	//   fires it post-unlock), and sched.OnArrival only updates
+	//   scheduler state, so there is no store-lock ↔ sched.mu inversion.
 	unsubAdd := o.store.AddListener(store.EventObjectAdded, func(id manifest.NamedResource, _ any) {
 		sched.OnArrival(id, o.dagSchedulable(id))
 	}, false)
 	defer unsubAdd()
 	//   EventStatusUpdated: wake nodes parked on a dep that reached a terminal
-	//   status. Terminal-gated inside OnStatusWake (Pending writes are ignored).
+	//   status. Non-terminal (Pending) updates return before the scheduler lock.
 	unsubStatus := o.store.AddListener(store.EventStatusUpdated, func(id manifest.NamedResource, payload any) {
 		info, ok := payload.(store.StatusInfo)
 		if !ok {
@@ -125,7 +140,7 @@ func (o *Orchestrator) runDAG(ctx context.Context) error {
 	defer unsubStatus()
 
 	sched.Seed(o.seedNodes())
-	sched.Run(ctx)
+	err := sched.Run(ctx)
 
-	return errors.Join(o.finalize(), ctx.Err())
+	return errors.Join(err, o.finalize())
 }

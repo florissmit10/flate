@@ -88,6 +88,8 @@ flate diff ks --path ./kubernetes --path-orig ../baseline/kubernetes
 
 `--path` can point at a narrow Flux entry like `./kubernetes/flux/cluster`; flate iteratively follows each loaded KS's `spec.path` to discover the rest of the tree.
 
+`--base <rev>` materializes the rev's tree instead of needing a second worktree, and `flate diff` without either flag picks the merge-base with the branch's upstream. A rev the checkout doesn't hold (a `fetch-depth: 1` clone of another branch, or files written over `git init` with only a remote) is fetched from `origin`, so `--base main` works there too.
+
 ## Source kinds and auth
 
 | Kind               | Status         | Auth (`spec.secretRef`)                                                                                                                    |
@@ -102,6 +104,8 @@ flate diff ks --path ./kubernetes --path-orig ../baseline/kubernetes
 flate renders your own repo offline, so Secret values pass through verbatim — only SOPS ciphertext is wiped to `..PLACEHOLDER_<key>..` (flate can't decrypt it, and raw `ENC[…]` poisons rendering). A wiped (or genuinely missing) auth value is treated as missing — auth fails with a clear "missing username/password" instead of attempting auth with the placeholder. See [Behaviors](#behaviors) for `--allow-missing-secrets`, which soft-skips affected sources end-to-end.
 
 ## Behaviors
+
+**Chart digest tracking** - flate detects `DisableChartDigestTracking=true` in file-loaded HelmRelease values under `instance.kustomize.patches[]` when the inline patch has no target or targets `name: helm-controller`, including releases owned by a Kustomization. For direct OCIRepository chart references, tracking emits versions such as `6.15.0+ff3d3e14728f`; disabling it preserves `6.15.0` and the corresponding chart-derived labels. Revision validation and full digest/revision cache identity apply in both modes. **Breaking change from #969 for clusters using this gate:** detection restores the original version and labels. With the override absent, flate auto-detects; `--disable-chart-digest-tracking` or `=true` forces tracking off, while `=false` forces it on. `FLATE_DISABLE_CHART_DIGEST_TRACKING=true/false` also overrides detection, and the CLI flag takes precedence. Directly committed FluxInstance CRs and flux-bootstrap Deployment patches require the explicit flag.
 
 **SOPS** — `spec.decryption` is not implemented. Encrypted Secret/ConfigMap values get wiped to `..PLACEHOLDER_<key>..` (flate can't decrypt offline, and raw `ENC[…]` ciphertext poisons downstream rendering). Cleartext Secret values are NOT wiped — flate renders your own repo, not a live cluster. Downstream `postBuild.substituteFrom` lookups resolve a SOPS value to the placeholder rather than failing.
 

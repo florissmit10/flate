@@ -255,3 +255,82 @@ func buildChartTarGz(t *testing.T, name, version string) []byte {
 	_ = gw.Close()
 	return buf.Bytes()
 }
+
+func TestFetchHTTPChart_BasicAuth(t *testing.T) {
+	chartBytes := buildChartTarGz(t, "app-template", "1.0.0")
+	requireAuth := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if u, p, ok := r.BasicAuth(); !ok || u != "alice" || p != "hunter2" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			next(w, r)
+		}
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/index.yaml", requireAuth(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(helmRepoIndex(chartDigest(chartBytes))))
+	}))
+	mux.HandleFunc("/app-template-1.0.0.tgz", requireAuth(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(chartBytes)
+	}))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	r := httpRepo(srv.URL)
+	r.SecretRef = &manifest.LocalObjectReference{Name: "creds"}
+	f := newHTTPFetcherWithSecrets(t, r, func(_, _ string) *manifest.Secret {
+		return &manifest.Secret{StringData: map[string]any{"username": "alice", "password": "hunter2"}}
+	})
+
+	if _, err := f.Fetch(context.Background(), helmChart("repo", "app-template", "1.0.0")); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+}
+
+func TestFetchHTTPChart_BasicAuthOtherHost(t *testing.T) {
+	chartBytes := buildChartTarGz(t, "app-template", "1.0.0")
+	for _, tc := range []struct {
+		name            string
+		passCredentials bool
+		wantAuth        bool
+	}{
+		{name: "withheld by default", passCredentials: false, wantAuth: false},
+		{name: "forwarded with passCredentials", passCredentials: true, wantAuth: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotAuth bool
+			chartSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _, gotAuth = r.BasicAuth()
+				_, _ = w.Write(chartBytes)
+			}))
+			t.Cleanup(chartSrv.Close)
+			repoSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprintf(w, `apiVersion: v1
+entries:
+  app-template:
+    - name: app-template
+      version: 1.0.0
+      digest: %s
+      urls:
+        - %s/app-template-1.0.0.tgz
+`, chartDigest(chartBytes), chartSrv.URL)
+			}))
+			t.Cleanup(repoSrv.Close)
+
+			r := httpRepo(repoSrv.URL)
+			r.SecretRef = &manifest.LocalObjectReference{Name: "creds"}
+			r.PassCredentials = tc.passCredentials
+			f := newHTTPFetcherWithSecrets(t, r, func(_, _ string) *manifest.Secret {
+				return &manifest.Secret{StringData: map[string]any{"username": "alice", "password": "hunter2"}}
+			})
+
+			if _, err := f.Fetch(context.Background(), helmChart("repo", "app-template", "1.0.0")); err != nil {
+				t.Fatalf("Fetch: %v", err)
+			}
+			if gotAuth != tc.wantAuth {
+				t.Errorf("chart host got basic auth = %v, want %v", gotAuth, tc.wantAuth)
+			}
+		})
+	}
+}

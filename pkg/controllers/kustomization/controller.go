@@ -198,7 +198,8 @@ func (c *Controller) reconcile(ctx context.Context, ks *manifest.Kustomization) 
 	// envsubst's parser cannot handle. Mirror that behavior here:
 	// substitute per-doc, skip opted-out resources, so we match Flux
 	// bit-for-bit.
-	if vars := values.VarsMap(ks.PostBuildSubstitute); len(vars) > 0 {
+	if ks.PostBuild != nil {
+		vars := values.VarsMap(ks.PostBuildSubstitute)
 		for i, doc := range docs {
 			if manifest.HasSubstituteDisabled(doc) {
 				continue
@@ -250,6 +251,12 @@ func (c *Controller) reconcile(ctx context.Context, ks *manifest.Kustomization) 
 // render against a Flux repo that uses secret-substitute patterns.
 func (c *Controller) collectDeps(ks *manifest.Kustomization) []manifest.DependencyRef {
 	deps := slices.Clone(ks.DependsOn)
+	if f := c.Filter(); f != nil && f.Enabled() {
+		deps = slices.DeleteFunc(deps, func(d manifest.DependencyRef) bool {
+			return !f.ShouldReconcile(d.NamedResource) &&
+				(c.IsFileIndexed(d.NamedResource) || c.Store.GetObject(d.NamedResource) != nil)
+		})
+	}
 	if ks.SourceKind != "" && ks.SourceName != "" {
 		deps = append(deps, manifest.DependencyRef{
 			Kind: ks.SourceKind, Namespace: ks.SourceNamespace, Name: ks.SourceName,

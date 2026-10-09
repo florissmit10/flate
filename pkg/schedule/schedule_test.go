@@ -2,9 +2,13 @@ package schedule
 
 import (
 	"context"
+	"fmt"
 	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/task"
@@ -13,6 +17,95 @@ import (
 // id builds a Kustomization-kind NodeID for tests.
 func id(name string) NodeID {
 	return manifest.NamedResource{Kind: manifest.KindKustomization, Namespace: "ns", Name: name}
+}
+
+type dispatchFunc func(context.Context, NodeID, int) (Outcome, []NodeID)
+
+func (f dispatchFunc) Dispatch(ctx context.Context, id NodeID, drain int) (Outcome, []NodeID) {
+	return f(ctx, id, drain)
+}
+
+func TestRedispatchLimit(t *testing.T) {
+	for _, mode := range []string{"running arrival", "terminal arrival", "drain replay"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			var s *Scheduler
+			var runs atomic.Int64
+			victim := id("feedback")
+			producer := id("producer")
+			disp := dispatchFunc(func(ctx context.Context, nid NodeID, _ int) (Outcome, []NodeID) {
+				if nid == producer {
+					for ctx.Err() == nil {
+						s.mu.Lock()
+						terminal := s.nodes[victim].state == stateTerminal
+						err := s.err
+						s.mu.Unlock()
+						if err != nil {
+							break
+						}
+						if terminal {
+							s.OnArrival(victim, true)
+						} else {
+							runtime.Gosched()
+						}
+					}
+					return OutcomeTerminal, nil
+				}
+				runs.Add(1)
+				switch mode {
+				case "running arrival":
+					s.OnArrival(victim, true)
+				case "drain replay":
+					s.OnArrival(NodeID{Kind: manifest.KindConfigMap, Name: "values"}, false)
+				}
+				return OutcomeTerminal, nil
+			})
+			s = New(task.NewBounded(2), disp)
+			s.SetRerunAtDrain(func(NodeID) bool { return mode == "drain replay" })
+			s.Seed([]NodeID{victim})
+			if mode == "terminal arrival" {
+				s.Seed([]NodeID{producer})
+			}
+			err := s.Run(ctx)
+			if err == nil || !strings.Contains(err.Error(), victim.String()) || !strings.Contains(err.Error(), "exceeded 32 redispatches") {
+				t.Fatalf("Run error = %v, want node-specific redispatch limit", err)
+			}
+			if ctx.Err() != nil {
+				t.Fatalf("redispatch limit must terminate before deadline: %v", ctx.Err())
+			}
+			if got := runs.Load(); got != int64(maxRedispatches+1) {
+				t.Fatalf("dispatches = %d, want %d", got, maxRedispatches+1)
+			}
+		})
+	}
+}
+
+func TestRedispatchBudgetAllowsConvergence(t *testing.T) {
+	for _, outcome := range []Outcome{OutcomeTerminal, OutcomeBlocked} {
+		t.Run(fmt.Sprintf("outcome_%d", outcome), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			limit := maxRedispatches
+			var s *Scheduler
+			runs := 0
+			s = New(task.NewBounded(2), dispatchFunc(func(_ context.Context, nid NodeID, _ int) (Outcome, []NodeID) {
+				runs++
+				if runs <= limit {
+					s.OnArrival(nid, true)
+					return outcome, []NodeID{id("dep")}
+				}
+				return OutcomeTerminal, nil
+			}))
+			s.Seed([]NodeID{id("finite")})
+			if err := s.Run(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if runs != limit+1 {
+				t.Fatalf("dispatches = %d, want %d", runs, limit+1)
+			}
+		})
+	}
 }
 
 // fakeDisp is a store-free, controller-free Dispatcher driven by a fixed
@@ -74,18 +167,18 @@ func (f *fakeDisp) Dispatch(_ context.Context, nid NodeID, drainLevel int) (Outc
 	}
 	deps := f.graph[nid]
 	var blocked []NodeID
-	failed := false
+	var failed []NodeID
 	for _, d := range deps {
 		if f.termAny[d] {
 			if !f.termReady[d] {
-				failed = true
+				failed = append(failed, d)
 			}
 			continue // terminal-ready -> satisfied
 		}
 		if _, isNode := f.graph[d]; !isNode {
 			// absent dep
 			if drainLevel >= DrainCascade {
-				failed = true
+				failed = append(failed, d)
 				continue
 			}
 			blocked = append(blocked, d)
@@ -93,16 +186,16 @@ func (f *fakeDisp) Dispatch(_ context.Context, nid NodeID, drainLevel int) (Outc
 		}
 		// present but not yet terminal (pending)
 		if drainLevel >= DrainForce {
-			failed = true
+			failed = append(failed, d)
 			continue
 		}
 		blocked = append(blocked, d)
 	}
 	switch {
-	case failed:
+	case len(failed) > 0:
 		f.termAny[nid] = true
 		f.termReady[nid] = false
-		return OutcomeTerminal, nil
+		return OutcomeDependencyFailed, failed
 	case len(blocked) > 0:
 		return OutcomeBlocked, blocked
 	default:
@@ -142,7 +235,9 @@ func run(t *testing.T, f *fakeDisp, workers int) *Scheduler {
 		seeds = append(seeds, k)
 	}
 	s.Seed(seeds)
-	s.Run(context.Background())
+	if err := s.Run(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	return s
 }
 
@@ -222,8 +317,8 @@ func TestParkThenArrivalWake(t *testing.T) {
 	ts := task.NewBounded(8)
 	s := New(ts, f)
 	s.Seed([]NodeID{id("a"), id("keepalive")}) // x absent at start
-	done := make(chan struct{})
-	go func() { s.Run(context.Background()); close(done) }()
+	done := make(chan error, 1)
+	go func() { done <- s.Run(t.Context()) }()
 
 	// Wait until a has actually parked (its first Dispatch ran and reported
 	// Blocked) before introducing x, so we exercise park-then-wake.
@@ -231,7 +326,9 @@ func TestParkThenArrivalWake(t *testing.T) {
 	s.OnArrival(id("x"), true) // x appears (render-discovered) -> wakes a
 	waitUntil(t, func() bool { term, _ := f.state(id("a")); return term })
 	close(gate) // let keepalive finish so Run can reach the fixpoint
-	<-done
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
 	assertReady(t, f, "a")
 	assertReady(t, f, "x")
 }
@@ -323,15 +420,17 @@ func TestDrainRerunReexpandsOnArrival(t *testing.T) {
 	s := New(ts, f)
 	s.SetRerunAtDrain(func(id NodeID) bool { return f.drainRerun[id] })
 	s.Seed([]NodeID{id("rs"), id("keepalive")})
-	done := make(chan struct{})
-	go func() { s.Run(context.Background()); close(done) }()
+	done := make(chan error, 1)
+	go func() { done <- s.Run(t.Context()) }()
 
 	// rs ran once. Now a late data arrival dirties the store; with the pool held
 	// non-idle by keepalive, the fixpoint can't fire until we release.
 	waitUntil(t, func() bool { return f.runCount(id("rs")) >= 1 })
 	s.OnArrival(NodeID{Kind: manifest.KindConfigMap, Namespace: "ns", Name: "late"}, false)
 	close(gate)
-	<-done
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
 
 	if rc := f.runCount(id("rs")); rc != 2 {
 		t.Fatalf("rerun node ran %d times; want exactly 2 (initial + one re-expansion)", rc)
@@ -370,6 +469,59 @@ func TestDanglingChainRunCountBounded(t *testing.T) {
 		assertFailed(t, f, n)
 		if rc := f.runCount(id(n)); rc > 6 {
 			t.Fatalf("%s ran %d times; expected a small bounded count", n, rc)
+		}
+	}
+}
+
+func TestRedispatch_ContentBudget(t *testing.T) {
+	for _, mode := range []string{"terminal", "blocked", "alternating"} {
+		for _, requests := range []int{maxRedispatches, maxRedispatches + 1} {
+			t.Run(fmt.Sprintf("%s/%d", mode, requests), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				var s *Scheduler
+				var runs int
+				started, finished := make(chan struct{}), make(chan struct{})
+				victim, companion := id("content"), id("companion")
+				s = New(task.NewBounded(2), dispatchFunc(func(ctx context.Context, nid NodeID, _ int) (Outcome, []NodeID) {
+					if nid == companion {
+						close(started)
+						select {
+						case <-finished:
+						case <-ctx.Done():
+						}
+						return OutcomeTerminal, nil
+					}
+					select {
+					case <-started:
+					case <-ctx.Done():
+						return OutcomeTerminal, nil
+					}
+					runs++
+					if runs > requests {
+						close(finished)
+						return OutcomeTerminal, nil
+					}
+					s.OnArrival(nid, true)
+					s.OnArrival(nid, true)
+					if mode == "blocked" || mode == "alternating" && runs%2 == 0 {
+						return OutcomeBlocked, []NodeID{id("missing")}
+					}
+					return OutcomeTerminal, nil
+				}))
+				s.Seed([]NodeID{victim, companion})
+				err := s.Run(ctx)
+				if requests == maxRedispatches {
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else if err == nil || !strings.Contains(err.Error(), victim.String()) {
+					t.Fatalf("Run error = %v, want node-specific non-convergence", err)
+				}
+				if ctx.Err() != nil || runs != maxRedispatches+1 {
+					t.Fatalf("dispatches=%d, context=%v; want %d executions before deadline", runs, ctx.Err(), maxRedispatches+1)
+				}
+			})
 		}
 	}
 }

@@ -7,12 +7,14 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/go-git/go-git/v5"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
@@ -33,13 +35,9 @@ import (
 type commonFlags struct {
 	path     string
 	pathOrig string
-	// pathOrigRoot / pathOrigSelfURLs are resolved by resolveBaseline for
-	// the --base flow: the materialized baseline tree carries no .git, so
-	// its repo root (the spec.path anchor + change-detect root) and the
-	// live tree's remote URLs (for self-referential aliasing on the
-	// baseline side) are threaded explicitly rather than re-derived from a
-	// .git. Empty for an explicit --path-orig (the CLI defaults the root
-	// via repoRootOf and lets the side read its own .git remotes).
+	// The materialized --base tree carries no .git, so its source root
+	// is threaded explicitly. Snapshots without .git use the live tree's
+	// remote URLs for self-referential aliasing.
 	pathOrigRoot         string
 	pathOrigSelfURLs     []string
 	krmIgnore            string
@@ -246,6 +244,7 @@ func bindBase(fs *pflag.FlagSet, f *commonFlags) {
 	fs.StringVar(&f.base, "base", "",
 		"baseline git rev (e.g. main, origin/main, HEAD~3, SHA) — "+
 			"materializes the rev's tree to a tempdir and runs in changed-only mode. "+
+			"A rev the checkout doesn't hold is fetched from its origin remote. "+
 			"On `diff`, omitting --base auto-detects via merge-base with @{u} / origin/HEAD. "+
 			"On `build`/`get`/`test`, omitting --base keeps the default full-tree behavior. "+
 			"Mutually exclusive with --path-orig.")
@@ -294,13 +293,16 @@ func (c *commonFlags) includeNamespace(filter *change.Filter, ns string) bool {
 // helmFlags collect the helm template options. Mirrors flux-local's
 // --kube-version/--api-versions/--no-hooks/etc.
 type helmFlags struct {
-	kubeVersion          string
-	apiVersions          string
-	isUpgrade            bool
-	noHooks              bool
-	showOnly             []string
-	enableDNS            bool
-	skipSchemaValidation bool
+	kubeVersion                string
+	apiVersions                string
+	isUpgrade                  bool
+	noHooks                    bool
+	showOnly                   []string
+	enableDNS                  bool
+	skipSchemaValidation       bool
+	disableChartDigestTracking bool
+	// The flag pointer preserves explicit CLI/environment presence in value copies.
+	digestTrackingFlag *pflag.Flag
 }
 
 func bindHelmFlags(fs *pflag.FlagSet, h *helmFlags) {
@@ -317,21 +319,25 @@ func bindHelmFlags(fs *pflag.FlagSet, h *helmFlags) {
 	fs.BoolVar(&h.enableDNS, "enable-dns", false, "enable DNS lookups during helm template")
 	fs.BoolVar(&h.skipSchemaValidation, "skip-schema-validation", false,
 		"skip helm values.schema.json validation (dominates allocation churn on big repos)")
+	fs.BoolVar(&h.disableChartDigestTracking, "disable-chart-digest-tracking", false,
+		"preserve original OCI chart versions (absent: auto-detect; =false: force digest tracking)")
+	h.digestTrackingFlag = fs.Lookup("disable-chart-digest-tracking")
 }
 
 func (c commonFlags) helmOptions(h helmFlags) helm.Options {
 	return helm.Options{
-		SkipCRDs:             c.skipCRDs,
-		SkipSecrets:          c.skipSecrets,
-		SkipKinds:            c.skipKinds,
-		KubeVersion:          h.kubeVersion,
-		APIVersions:          h.apiVersions,
-		IsUpgrade:            h.isUpgrade,
-		NoHooks:              h.noHooks,
-		ShowOnly:             h.showOnly,
-		EnableDNS:            h.enableDNS,
-		SkipSchemaValidation: h.skipSchemaValidation,
-		SkipTests:            true,
+		SkipCRDs:                   c.skipCRDs,
+		SkipSecrets:                c.skipSecrets,
+		SkipKinds:                  c.skipKinds,
+		KubeVersion:                h.kubeVersion,
+		APIVersions:                h.apiVersions,
+		IsUpgrade:                  h.isUpgrade,
+		NoHooks:                    h.noHooks,
+		ShowOnly:                   h.showOnly,
+		EnableDNS:                  h.enableDNS,
+		SkipSchemaValidation:       h.skipSchemaValidation,
+		DisableChartDigestTracking: h.disableChartDigestTracking,
+		SkipTests:                  true,
 	}
 }
 
@@ -360,13 +366,37 @@ func (c commonFlags) helmOptions(h helmFlags) helm.Options {
 //
 // Callers receive a no-op when no materialization happened (no
 // --base / no autoFallback / explicit --path-orig).
-func resolveBaseline(c *commonFlags, autoFallback bool) (func(), error) {
+func resolveBaseline(ctx context.Context, c *commonFlags, autoFallback bool) (func(), error) {
 	noop := func() {}
 	if c.pathOrig != "" && c.base != "" {
 		return noop, errors.New("--path-orig and --base are mutually exclusive")
 	}
 	if c.pathOrig != "" {
-		// Explicit --path-orig — caller already specified the baseline.
+		c.pathOrigSelfURLs = nil
+		root, side := c.baselineRoot(), "baseline tree"
+		if _, err := os.Stat(filepath.Join(root, ".git")); errors.Is(err, os.ErrNotExist) {
+			// Snapshots without git metadata inherit the current source identity.
+			root, side = repoRootOf(c.path), "working tree"
+		} else if err != nil {
+			return noop, fmt.Errorf("baseline: stat baseline tree git metadata: %w", err)
+		}
+		repo, err := git.PlainOpenWithOptions(root, &git.PlainOpenOptions{
+			EnableDotGitCommonDir: true,
+		})
+		if side == "working tree" && errors.Is(err, git.ErrRepositoryNotExists) {
+			return noop, nil
+		}
+		if err != nil {
+			return noop, fmt.Errorf("baseline: open %s: %w", side, err)
+		}
+		cfg, err := repo.Config()
+		if err != nil {
+			return noop, fmt.Errorf("baseline: read %s git config: %w", side, err)
+		}
+		for _, remote := range cfg.Remotes {
+			c.pathOrigSelfURLs = append(c.pathOrigSelfURLs, remote.URLs...)
+		}
+		slices.Sort(c.pathOrigSelfURLs)
 		return noop, nil
 	}
 	if c.base == "" && !autoFallback {
@@ -375,7 +405,7 @@ func resolveBaseline(c *commonFlags, autoFallback bool) (func(), error) {
 		// default).
 		return noop, nil
 	}
-	res, err := baseline.AutoResolve(c.path, c.base, cacheroot.New(c.resolveCacheRoot()))
+	res, err := baseline.AutoResolve(ctx, c.path, c.base, cacheroot.New(c.resolveCacheRoot()))
 	if err != nil {
 		return noop, err
 	}
@@ -427,12 +457,13 @@ func buildOrchCfg(c commonFlags, h helmFlags) orchestrator.Config {
 		// (change.Detect diffs root-to-root): the materialized --base tree
 		// root, or the .git default of an explicit --path-orig. Replaces
 		// the core's old .git "widen" heuristic.
-		PathOrig:       c.baselineRoot(),
-		KRMIgnoreFile:  c.krmIgnore,
-		HelmOptions:    c.helmOptions(h),
-		WipeSecrets:    true,
-		RegistryConfig: c.registryConfig,
-		Concurrency:    c.concurrency,
+		PathOrig:                  c.baselineRoot(),
+		KRMIgnoreFile:             c.krmIgnore,
+		HelmOptions:               c.helmOptions(h),
+		DetectChartDigestTracking: h.digestTrackingFlag == nil || !h.digestTrackingFlag.Changed,
+		WipeSecrets:               true,
+		RegistryConfig:            c.registryConfig,
+		Concurrency:               c.concurrency,
 		SourceRetry: source.RetryConfig{
 			Attempts: c.sourceRetryAttempts,
 			MinWait:  c.sourceRetryMinWait,
@@ -479,7 +510,7 @@ func runOrchestrator(ctx context.Context, c commonFlags, h helmFlags, pre ...fun
 	// Cleanup is deferred (not bound to ctx) so the tempdir survives
 	// SIGINT until the orchestrator's read paths have actually
 	// unwound.
-	cleanup, err := resolveBaseline(&c, false)
+	cleanup, err := resolveBaseline(ctx, &c, false)
 	if err != nil {
 		return nil, nil, err
 	}

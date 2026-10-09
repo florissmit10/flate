@@ -328,8 +328,20 @@ func (s *Store) FailedResources() map[manifest.NamedResource]StatusInfo {
 func (s *Store) SetBlocked(id manifest.NamedResource, deps []manifest.NamedResource) {
 	sh := s.shardFor(id)
 	sh.mu.Lock()
-	sh.blocked[id] = slices.Clone(deps)
+	if len(deps) == 0 {
+		delete(sh.blocked, id)
+	} else {
+		sh.blocked[id] = slices.Clone(deps)
+	}
 	sh.mu.Unlock()
+}
+
+// HasBlocked reports whether id has a dependency-derived failure.
+func (s *Store) HasBlocked(id manifest.NamedResource) bool {
+	sh := s.shardFor(id)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	return len(sh.blocked[id]) > 0
 }
 
 // BlockedBy returns the immediate dependencies that blocked id (set via
