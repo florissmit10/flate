@@ -2,7 +2,11 @@ package oci
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +17,8 @@ import (
 	"github.com/home-operations/flate/internal/testutil"
 	"github.com/home-operations/flate/pkg/manifest"
 	"github.com/home-operations/flate/pkg/source"
+	"github.com/home-operations/flate/pkg/source/cacheroot"
+	"github.com/home-operations/flate/pkg/source/helmchart"
 )
 
 func ociRepo(name string, set func(s *sourcev1.OCIRepositorySpec)) *manifest.OCIRepository {
@@ -321,5 +327,62 @@ func TestFetcher_ResolveConfig_RegistryFallback(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// An OCI HelmRepository's chart is fetched through a synthesized
+// OCIRepository, so its secretRef takes the same registry fallback.
+func TestFetcher_OCIHelmRepositoryRegistryFallback(t *testing.T) {
+	const user, pass = "alice", "hunter2"
+	art := newFakeOCIArtifact(t, map[string]string{"Chart.yaml": "name: app\nversion: 1.0.0\n"})
+	upstream := startFakeRegistry(t, art.manifest, art.config, art.layer)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if u, p, ok := r.BasicAuth(); !ok || u != user || p != pass {
+			w.Header().Set("WWW-Authenticate", `Basic realm="test"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		upstream.Config.Handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	host := mustURL(t, srv.URL).Host
+
+	t.Setenv("DOCKER_CONFIG", t.TempDir()) // keeps the host's docker config out
+	config := filepath.Join(t.TempDir(), "config.json")
+	auth := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+	if err := os.WriteFile(config, fmt.Appendf(nil, `{"auths":{%q:{"auth":%q}}}`, host, auth), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	layout := cacheroot.New(t.TempDir())
+	cache := source.NewCache(layout)
+	ociFetcher := &Fetcher{
+		Cache:          cache,
+		RegistryConfig: config,
+		Secrets:        func(_, _ string) *manifest.Secret { return nil },
+	}
+	repo := &manifest.HelmRepository{
+		Name: "charts", Namespace: "ns",
+		URL: "oci://" + host + "/charts", Type: manifest.RepoTypeOCI, Insecure: true,
+		SecretRef: &manifest.LocalObjectReference{Name: "creds"},
+	}
+	charts, err := helmchart.New(nil, func(_, _ string) *manifest.HelmRepository { return repo }, ociFetcher, cache, layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hc := helmchart.Synthesize(repo, "app", "1.0.0")
+
+	if _, err := charts.Fetch(t.Context(), hc); !errors.Is(err, manifest.ErrMissingSecret) {
+		t.Fatalf("first fetch err = %v, want ErrMissingSecret", err)
+	}
+	got, err := charts.Fetch(source.WithRegistryFallback(t.Context()), hc)
+	if err != nil {
+		t.Fatalf("fallback fetch: %v", err)
+	}
+	if got.Kind != manifest.KindHelmChart {
+		t.Errorf("artifact Kind = %q, want %q", got.Kind, manifest.KindHelmChart)
+	}
+	if b := mustReadFile(t, filepath.Join(got.LocalPath, "Chart.yaml")); !strings.Contains(b, "name: app") {
+		t.Errorf("Chart.yaml = %q", b)
 	}
 }
